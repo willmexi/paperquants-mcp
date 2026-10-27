@@ -24,6 +24,13 @@ const openBrowser = (url: string) => {
 };
 
 const coin = z.enum(['BTC', 'ETH']);
+// Ready-made limit sets so Claude can offer one simple choice; any field can still be overridden.
+const PRESETS = {
+  careful: { maxLeverage: 100, maxMarginPctPerTrade: 10, maxDailyLossPct: 20 },
+  balanced: { maxLeverage: 300, maxMarginPctPerTrade: 25, maxDailyLossPct: 35 },
+  aggressive: { maxLeverage: 500, maxMarginPctPerTrade: 40, maxDailyLossPct: 50 },
+  degen: { maxLeverage: 1000, maxMarginPctPerTrade: 50, maxDailyLossPct: 70, riskProfile: 'DEGEN' as const },
+};
 const limits = z.object({
   maxLeverage: z.number().int().min(1).max(1000).describe('Highest leverage any order may use (Papertrade allows up to 1000×).'),
   capitalUsd: z.number().positive().describe('How much of the Papertrade account this agent may trade with, in USD.'),
@@ -100,10 +107,20 @@ export async function runMcp(): Promise<void> {
 
   // ---- agents (local engine) ----
   server.registerTool('create_agent', {
-    description: "Start an agent that runs the strategy code every second and trades its own wallet's Papertrade account within the limits. ONLY after presenting the research and getting the user's explicit approval of the strategy AND every limit in this conversation; set user_approved=true only then.",
-    inputSchema: { name: z.string().min(2).max(60), thesis: z.string().describe('Why it should make money and what would prove it wrong.'), code: z.string(), params: z.record(z.string(), z.any()).optional(), limits,
-      wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).describe("This agent's OWN wallet (from new_agent_wallet or connect_external_wallet). One agent per wallet, never shared."), user_approved: z.boolean() },
-  }, wrap(async ({ user_approved, ...a }) => engine('/agents', { ...a, userApproved: user_approved, model: 'claude' })));
+    description: "Start an agent that runs the strategy code every second within the limits. Default mode is demo: $1,000 of demo money on live prices, no wallet, nothing real traded, so create it as soon as the user picks a strategy and a limit preset. mode live (real money, its own wallet) only after explicit approval; use go_live for a demo agent that did well.",
+    inputSchema: { name: z.string().min(2).max(60), thesis: z.string().describe('Why it should make money and what would prove it wrong.'), code: z.string(), params: z.record(z.string(), z.any()).optional(),
+      preset: z.enum(['careful', 'balanced', 'aggressive', 'degen']).optional().describe('careful 100× / 10% per trade / 20% daily stop · balanced 300× / 25% / 35% · aggressive 500× / 40% / 50% · degen 1000× / 50% / 70%. Coins and capital still apply.'),
+      limits: limits.partial().optional().describe('Overrides on top of the preset. Defaults: capitalUsd 1000 (demo money), coins BTC+ETH.'),
+      mode: z.enum(['demo', 'live']).default('demo').describe('demo (default) = demo money, no wallet. live = real money on its own wallet.'),
+      wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe("Live only: this agent's OWN wallet (from new_agent_wallet or connect_external_wallet). One agent per wallet, never shared."), user_approved: z.boolean() },
+  }, wrap(async ({ user_approved, preset, limits: l, ...a }) => engine('/agents', {
+    ...a, limits: { capitalUsd: 1000, coins: ['BTC', 'ETH'], ...(preset ? PRESETS[preset] : PRESETS.balanced), ...(l ?? {}) },
+    userApproved: a.mode === 'demo' ? true : user_approved, model: 'claude',
+  })));
+  server.registerTool('go_live', {
+    description: "Switch a demo agent to real money on its own wallet (same strategy and limits; capitalUsd can be set). Only after the user saw its demo results and explicitly approved real money.",
+    inputSchema: { id: z.string(), wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/), capital_usd: z.number().positive().optional(), user_approved: z.boolean() },
+  }, wrap(async ({ id, wallet, capital_usd, user_approved }) => engine(`/agents/${id}/live`, { wallet, capitalUsd: capital_usd, userApproved: user_approved })));
   server.registerTool('list_agents', { description: 'Every local agent: status, real equity, paper P&L, trades, open positions.', inputSchema: {} },
     wrap(async () => engine('/agents')));
   server.registerTool('agent_detail', { description: 'One agent in full: limits, real and paper positions, recent real trades and P&L, strategy errors and its log.', inputSchema: { id: z.string() } },

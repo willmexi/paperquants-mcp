@@ -36,6 +36,7 @@ export function serve(engine: Engine) {
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)$/)?.[1]) && req.method === 'GET') return send(200, engine.describe(id));
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/limits$/)?.[1]) && req.method === 'POST') return send(200, engine.updateLimits(id, b));
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/status$/)?.[1]) && req.method === 'POST') return send(200, engine.setStatus(id, b.status));
+      if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/live$/)?.[1]) && req.method === 'POST') return send(200, engine.goLive(id, b.wallet, b.userApproved, b.capitalUsd));
       if (m === 'POST /kill') return send(200, engine.setKill(!!b.on));
 
       // ---- agent wallets (one per agent) ----

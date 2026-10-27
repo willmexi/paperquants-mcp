@@ -27,12 +27,13 @@ type MirrorStatus = 'opening' | 'open' | 'closing' | 'closed' | 'failed';
 interface Mirror { simId: number; coin: string; side: 'long' | 'short'; leverage: number; marginUsd: number; intentId?: string; positionId?: string; entry?: number; status: MirrorStatus; openedAt: number; closedAt?: number; pnlUsd?: number; error?: string }
 
 export interface AgentRecord {
-  id: string; netId?: number; wallet: string; name: string; thesis: string; code: string; params: Record<string, unknown>; limits: Limits;
+  id: string; netId?: number; mode?: 'demo' | 'live'; wallet: string; name: string; thesis: string; code: string; params: Record<string, unknown>; limits: Limits;
   status: 'running' | 'paused' | 'stopped'; pausedReason?: string; createdAt: number; model?: string;
   realEquity: number; day: { date: string; start: number }; account?: AccountSnapshot; mirrors: Mirror[]; log: string[];
 }
 
-interface Live { rec: AgentRecord; runtime: StrategyRuntime; account: Account; venue: VenueAdapter; lastRejected?: string }
+interface Live { rec: AgentRecord; runtime: StrategyRuntime; account: Account; venue: VenueAdapter | null; lastRejected?: string }
+const isDemo = (r: AgentRecord) => r.mode === 'demo' || !r.wallet;
 interface Snap { at: number; balanceUsd: number; availableUsd: number; positions: LivePosition[] }
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -90,7 +91,7 @@ export class Engine {
     const runtime = inert ? new StrategyRuntime('function onTick(){}', {}, []) : new StrategyRuntime(rec.code, rec.params, [], (rec.account?.state as Record<string, unknown>) ?? undefined, () => rec.limits.coins);
     const account = new Account(rec.limits.capitalUsd, 1000, [], rec.account);
     account.guard = (o) => this.guard(rec, account, o);
-    const l = { rec, runtime, account, venue: new PapertradeAdapter(rec.wallet) };
+    const l = { rec, runtime, account, venue: isDemo(rec) ? null : new PapertradeAdapter(rec.wallet) };
     this.live.set(rec.id, l);
     return l;
   }
@@ -131,7 +132,8 @@ export class Engine {
 
   /** Paper opens become real opens within ~1s; paper exits (TP/SL/time) become real closes. */
   private syncMirrors(a: Live): void {
-    if (!a.venue.ready()) return;
+    const venue = a.venue;
+    if (!venue || !venue.ready()) return; // demo agents trade demo money only
     const now = Date.now();
     const snap = this.snaps.get(a.rec.wallet);
     const paper = new Map(a.account.positions.map((p) => [p.id, p]));
@@ -145,11 +147,11 @@ export class Engine {
       if (snap) margin = Math.min(margin, Math.floor(snap.availableUsd * 100) / 100);
       const m: Mirror = { simId: p.id, coin: p.coin, side: p.side, leverage: Math.round(p.leverage), marginUsd: margin, status: 'opening', openedAt: now };
       a.rec.mirrors.push(m);
-      if (margin < a.venue.limits().minMarginUsd) {
+      if (margin < venue.limits().minMarginUsd) {
         m.status = 'failed'; m.error = `real margin $${margin} under Papertrade's $1 minimum`;
         continue;
       }
-      void a.venue.open(p.coin, p.side, margin, m.leverage)
+      void venue.open(p.coin, p.side, margin, m.leverage)
         .then((r) => { m.intentId = r.intentId; this.note(a, `opened ${p.side} ${p.coin} ${m.leverage}× $${margin}`); })
         .catch((e) => { m.status = 'failed'; m.error = (e as Error).message; this.note(a, `open failed: ${m.error}`); });
     }
@@ -161,7 +163,7 @@ export class Engine {
   private closeMirror(a: Live, m: Mirror): void {
     if (!m.positionId) { m.status = 'closing'; return; } // closed by reconcile as soon as Papertrade reports its id
     m.status = 'closing';
-    void a.venue.close([m.positionId])
+    void a.venue?.close([m.positionId])
       .then(() => this.note(a, `closed ${m.side} ${m.coin}`))
       .catch((e) => { m.status = 'open'; this.note(a, `close failed, retrying: ${(e as Error).message}`); });
   }
@@ -170,6 +172,7 @@ export class Engine {
    *  closes, and settle realized P&L from Papertrade's own history. */
   async reconcile(): Promise<void> {
     for (const a of this.live.values()) {
+      if (!a.venue) continue; // demo
       const w = findWallet(a.rec.wallet);
       if (w?.kind === 'local' && w.keyStatus !== 'active' && Date.now() - (this.lastKeyTry.get(w.address) ?? 0) > 60_000) {
         this.lastKeyTry.set(w.address, Date.now());
@@ -208,6 +211,7 @@ export class Engine {
 
   /** Realized P&L straight from Papertrade's own trade history (adjusted P&L, after fees and the builder fee). */
   private async settlePnl(a: Live): Promise<void> {
+    if (!a.venue) return;
     const res = await a.venue.trades();
     const pnlOf = new Map<string, number>();
     for (const t of res.items ?? []) {
@@ -224,9 +228,11 @@ export class Engine {
   }
 
   private dailyLossCheck(a: Live): void {
-    if (a.rec.day.date !== today()) a.rec.day = { date: today(), start: a.rec.realEquity };
-    const unreal = a.account.equity((c) => this.feed.quote(c)?.mid, Date.now()) - a.account.balance - a.account.positions.reduce((s, p) => s + p.margin, 0);
-    const now = a.rec.realEquity + unreal;
+    const paperEq = a.account.equity((c) => this.feed.quote(c)?.mid, Date.now());
+    // Demo agents are judged on demo equity; live ones on real equity plus open paper P&L.
+    const unreal = paperEq - a.account.balance - a.account.positions.reduce((s, p) => s + p.margin, 0);
+    const now = isDemo(a.rec) ? paperEq : a.rec.realEquity + unreal;
+    if (a.rec.day.date !== today()) a.rec.day = { date: today(), start: now };
     if (a.rec.day.start > 0 && now < a.rec.day.start * (1 - a.rec.limits.maxDailyLossPct / 100)) {
       this.pause(a, `daily loss limit hit (${a.rec.limits.maxDailyLossPct}%): closed everything until you resume it`);
     }
@@ -243,29 +249,62 @@ export class Engine {
 
   // ---------- control (called by the local HTTP API that the MCP tools use) ----------
 
-  async createAgent(input: { name: string; thesis: string; code: string; params?: Record<string, unknown>; limits: Partial<Limits>; wallet: string; userApproved: boolean; model?: string }) {
+  async createAgent(input: { name: string; thesis: string; code: string; params?: Record<string, unknown>; limits: Partial<Limits>; mode?: 'demo' | 'live'; wallet?: string; userApproved: boolean; model?: string }) {
     if (input.userApproved !== true) throw new Error('refused: the user has not approved this agent. Present the research and the limits, and ask them first.');
     if (this.killSwitch) throw new Error('the kill switch is on: switch it off first');
-    // One agent, one strategy, one wallet: budgets are never shared.
-    const w = input.wallet ? findWallet(input.wallet) : undefined;
-    if (!w) throw new Error('every agent needs its own wallet: create one with new_agent_wallet (generated on this computer) or connect_external_wallet (e.g. MetaMask), then pass its address');
-    if (w.agentId && this.live.has(w.agentId) && this.live.get(w.agentId)!.rec.status !== 'stopped') throw new Error(`wallet ${w.address} already runs agent ${w.agentId}: one agent per wallet`);
+    const demo = input.mode === 'demo';
+    // Live: one agent, one strategy, one wallet (budgets are never shared). Demo: demo money only, no wallet.
+    const w = demo ? undefined : this.freeWallet(input.wallet);
     const limits = validateLimits(input.limits);
     new StrategyRuntime(input.code, input.params ?? {}, []); // compile check
     const rec: AgentRecord = {
-      id: randomUUID().slice(0, 8), wallet: w.address, name: String(input.name).slice(0, 60), thesis: String(input.thesis ?? '').slice(0, 2000), code: input.code, params: input.params ?? {},
+      id: randomUUID().slice(0, 8), mode: demo ? 'demo' : 'live', wallet: w?.address ?? '', name: String(input.name).slice(0, 60), thesis: String(input.thesis ?? '').slice(0, 2000), code: input.code, params: input.params ?? {},
       limits, status: 'running', createdAt: Date.now(), model: input.model, realEquity: limits.capitalUsd, day: { date: today(), start: limits.capitalUsd }, mirrors: [], log: [],
     };
     this.instantiate(rec);
-    updateWallet(w.address, { agentId: rec.id, label: rec.name });
-    this.note(this.live.get(rec.id)!, `created on wallet ${w.address} (${w.kind}) with limits ${JSON.stringify(limits)}`);
-    if (session()) {
-      const strategy = { name: rec.name, code: rec.code, params: rec.params, hash: createHash('sha256').update(rec.code + JSON.stringify(rec.params)).digest('hex').slice(0, 16) };
-      api<{ id: number }>('/api/net/agents', { auth: true, body: { name: rec.name, venue: 'papertrade', wallet: rec.wallet, strategy, limits, model: rec.model } })
-        .then((r) => { rec.netId = r.id; this.persist(); }).catch(() => {});
-    }
+    if (w) updateWallet(w.address, { agentId: rec.id, label: rec.name });
+    this.note(this.live.get(rec.id)!, demo ? `created on demo money ($${limits.capitalUsd}) with limits ${JSON.stringify(limits)}` : `created on wallet ${w!.address} (${w!.kind}) with limits ${JSON.stringify(limits)}`);
+    this.register(rec);
     this.persist();
     return this.describe(rec.id);
+  }
+
+  private freeWallet(address?: string) {
+    const w = address ? findWallet(address) : undefined;
+    if (!w) throw new Error('a live agent needs its own wallet: create one with new_agent_wallet (generated on this computer) or connect_external_wallet (e.g. MetaMask), then pass its address. Or start with mode "demo" (demo money, no wallet).');
+    if (w.agentId && this.live.has(w.agentId) && this.live.get(w.agentId)!.rec.status !== 'stopped') throw new Error(`wallet ${w.address} already runs agent ${w.agentId}: one agent per wallet`);
+    return w;
+  }
+
+  /** Report the agent to PaperQuants (shown on the user's account page; live ones also on the verified leaderboard). */
+  private register(rec: AgentRecord): void {
+    if (!session()) return;
+    const strategy = { name: rec.name, code: rec.code, params: rec.params, hash: createHash('sha256').update(rec.code + JSON.stringify(rec.params)).digest('hex').slice(0, 16) };
+    api<{ id: number }>('/api/net/agents', { auth: true, body: { name: rec.name, venue: 'papertrade', mode: isDemo(rec) ? 'demo' : 'live', wallet: rec.wallet || null, strategy, limits: rec.limits, model: rec.model } })
+      .then((r) => { rec.netId = r.id; this.persist(); }).catch(() => {});
+  }
+
+  /** A demo agent that did well goes live on its own wallet: same strategy and limits, real money from now on. */
+  goLive(id: string, wallet: string, userApproved: boolean, capitalUsd?: number) {
+    if (userApproved !== true) throw new Error('refused: ask the user to approve going live (real money) first');
+    const a = this.get(id);
+    if (!isDemo(a.rec)) throw new Error('this agent is already live');
+    const w = this.freeWallet(wallet);
+    const oldNet = a.rec.netId;
+    a.account.closeAllNow((c) => this.feed.quote(c)?.mid, Date.now()); // start live flat
+    a.rec.mode = 'live';
+    a.rec.wallet = w.address;
+    if (capitalUsd) a.rec.limits = validateLimits({ ...a.rec.limits, capitalUsd });
+    a.rec.realEquity = a.rec.limits.capitalUsd;
+    a.rec.day = { date: today(), start: a.rec.realEquity };
+    a.rec.netId = undefined;
+    a.venue = new PapertradeAdapter(w.address);
+    updateWallet(w.address, { agentId: a.rec.id, label: a.rec.name });
+    this.note(a, `went live on wallet ${w.address} (${w.kind})`);
+    if (oldNet && session()) void api(`/api/net/agents/${oldNet}`, { method: 'PATCH', auth: true, body: { status: 'stopped' } }).catch(() => {});
+    this.register(a.rec);
+    this.persist();
+    return this.describe(id);
   }
 
   updateLimits(id: string, patch: Partial<Limits>) {
@@ -307,8 +346,8 @@ export class Engine {
     const mid = (c: Coin) => this.feed.quote(c)?.mid;
     const paperEq = a.account.equity(mid, now);
     return {
-      id: a.rec.id, name: a.rec.name, wallet: a.rec.wallet, walletKind: findWallet(a.rec.wallet)?.kind, liveTrading: a.venue.ready(), status: a.rec.status, pausedReason: a.rec.pausedReason, limits: a.rec.limits, createdAt: new Date(a.rec.createdAt).toISOString(),
-      realEquityUsd: Math.round(a.rec.realEquity * 100) / 100, paper: summarize(a.account.stats, paperEq, a.rec.limits.capitalUsd),
+      id: a.rec.id, name: a.rec.name, mode: isDemo(a.rec) ? 'demo' : 'live', wallet: a.rec.wallet || null, walletKind: a.rec.wallet ? findWallet(a.rec.wallet)?.kind : null, liveTrading: !!a.venue?.ready(), status: a.rec.status, pausedReason: a.rec.pausedReason, limits: a.rec.limits, createdAt: new Date(a.rec.createdAt).toISOString(),
+      realEquityUsd: isDemo(a.rec) ? null : Math.round(a.rec.realEquity * 100) / 100, demoEquityUsd: isDemo(a.rec) ? Math.round(paperEq * 100) / 100 : undefined, paper: summarize(a.account.stats, paperEq, a.rec.limits.capitalUsd),
       open: a.account.positions.map((p) => ({ coin: p.coin, side: p.side, leverage: p.leverage, margin: p.margin, entry: p.entry, ageSec: Math.round((now - p.openedAt) / 1000) })),
       realPositions: a.rec.mirrors.filter((m) => m.status === 'open' || m.status === 'opening' || m.status === 'closing'),
       recentReal: a.rec.mirrors.filter((m) => m.status === 'closed' || m.status === 'failed').slice(-10),
@@ -319,7 +358,7 @@ export class Engine {
   list() {
     return [...this.live.keys()].map((id) => {
       const d = this.describe(id);
-      return { id: d.id, name: d.name, wallet: d.wallet, liveTrading: d.liveTrading, status: d.status, pausedReason: d.pausedReason, realEquityUsd: d.realEquityUsd, paperPnlPct: Math.round(d.paper.pnlPct * 10) / 10, trades: d.paper.trades, open: d.open.length };
+      return { id: d.id, name: d.name, mode: d.mode, wallet: d.wallet, liveTrading: d.liveTrading, status: d.status, pausedReason: d.pausedReason, realEquityUsd: d.realEquityUsd, paperPnlPct: Math.round(d.paper.pnlPct * 10) / 10, trades: d.paper.trades, open: d.open.length };
     });
   }
 
@@ -387,7 +426,7 @@ export class Engine {
     for (const a of this.live.values()) {
       if (!a.rec.netId) continue;
       const d = this.describe(a.rec.id);
-      await api(`/api/net/agents/${a.rec.netId}/heartbeat`, { auth: true, body: { equity: d.realEquityUsd, open: d.realPositions.length, status: d.status } }).catch(() => {});
+      await api(`/api/net/agents/${a.rec.netId}/heartbeat`, { auth: true, body: { equity: d.realEquityUsd ?? d.demoEquityUsd, open: d.realPositions.length, status: d.status } }).catch(() => {});
     }
   }
 }

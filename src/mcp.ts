@@ -160,6 +160,8 @@ export async function runMcp(): Promise<void> {
     wrap(async ({ id }) => engine(`/agents/${id}/status`, { status: 'paused' })));
   server.registerTool('resume_agent', { description: 'Resume a paused agent (resets its daily-loss baseline).', inputSchema: { id: z.string() } },
     wrap(async ({ id }) => engine(`/agents/${id}/status`, { status: 'running' })));
+  server.registerTool('retire_agent', { description: "Remove an agent for good when the user asks: closes its positions, stops it, removes it from the list and the site, and frees its wallet for a new agent (the wallet and its key are kept). Never edit PaperQuants files by hand.", inputSchema: { id: z.string() } },
+    wrap(async ({ id }) => engine(`/agents/${id}/retire`, {})));
   server.registerTool('kill_all', { description: 'Emergency stop: closes every position the engine opened and blocks all new trades until switched off (on=false).', inputSchema: { on: z.boolean().default(true) } },
     wrap(async ({ on }) => engine('/kill', { on })));
 

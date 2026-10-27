@@ -37,6 +37,7 @@ export function serve(engine: Engine) {
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/limits$/)?.[1]) && req.method === 'POST') return send(200, engine.updateLimits(id, b));
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/status$/)?.[1]) && req.method === 'POST') return send(200, engine.setStatus(id, b.status));
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/live$/)?.[1]) && req.method === 'POST') return send(200, engine.goLive(id, b.wallet, b.userApproved, b.capitalUsd));
+      if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/retire$/)?.[1]) && req.method === 'POST') return send(200, engine.retire(id));
       if (m === 'POST /kill') return send(200, engine.setKill(!!b.on));
       if (m === 'POST /shutdown') { send(200, { ok: true }); engine.stop(); setTimeout(() => process.exit(0), 200); return; }
       if (m === 'GET /config') return send(200, engine.config);

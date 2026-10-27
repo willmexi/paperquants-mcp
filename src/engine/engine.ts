@@ -343,6 +343,23 @@ export class Engine {
     return this.describe(id);
   }
 
+  /** Retire an agent for good: close its positions, stop it, drop it from the list (kept in retired.json), free its wallet. */
+  retire(id: string) {
+    const a = this.get(id);
+    if (a.rec.status === 'running') this.pause(a, 'retired by the user');
+    a.rec.status = 'stopped';
+    if (a.rec.mirrors.some((m) => m.status === 'open' || m.status === 'opening' || m.status === 'closing')) {
+      throw new Error('its real positions are still closing on Papertrade: try again in a few seconds');
+    }
+    const archive = readJson<AgentRecord[]>('retired.json', []);
+    writeJson('retired.json', [...archive, { ...a.rec, retiredAt: Date.now() } as AgentRecord]);
+    if (a.rec.wallet && findWallet(a.rec.wallet)?.agentId === a.rec.id) updateWallet(a.rec.wallet, { agentId: undefined });
+    this.live.delete(id);
+    if (a.rec.netId && session()) void api(`/api/net/agents/${a.rec.netId}`, { method: 'PATCH', auth: true, body: { status: 'stopped' } }).catch(() => {});
+    this.persist();
+    return { retired: id, name: a.rec.name, walletKept: a.rec.wallet || null };
+  }
+
   setKill(on: boolean) {
     this.killSwitch = on;
     writeJson('kill.json', { on });

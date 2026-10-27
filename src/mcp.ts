@@ -24,6 +24,17 @@ const openBrowser = (url: string) => {
 };
 
 const coin = z.enum(['BTC', 'ETH']);
+const NAMES = ['Night Owl', 'Spike Fader', 'Iron Hands', 'Tide Turner', 'Moon Hunter', 'Quiet Storm', 'Red Fox', 'Fast Lane', 'Deep Diver', 'Echo', 'Atlas', 'Nova', 'Blitz', 'Ghost', 'Falcon', 'Orbit', 'Raven', 'Viper', 'Comet', 'Drifter', 'Zen', 'Ember', 'Pulse', 'Sable'];
+/** Small, safe parameter tweaks (±15%, integers stay integers, leverage untouched) so a batch of agents differs. */
+function jitter(p: Record<string, unknown>, seed: number): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (typeof v !== 'number' || ['lev', 'size'].includes(k)) continue;
+    const f = 1 + (((seed * 7919 + k.length * 31) % 31) - 15) / 100;
+    out[k] = Number.isInteger(v) ? Math.max(1, Math.round(v * f)) : Math.round(v * f * 1000) / 1000;
+  }
+  return out;
+}
 // Ready-made limit sets so Claude can offer one simple choice; any field can still be overridden.
 const PRESETS = {
   careful: { maxLeverage: 100, maxMarginPctPerTrade: 10, maxDailyLossPct: 20 },
@@ -116,6 +127,58 @@ export async function runMcp(): Promise<void> {
   // ---- agents (local engine) ----
   server.registerTool('strategy_menu', { description: 'Ready-to-run PaperQuants strategies with honest confidence scores (0–100), why, coins, suggested risk preset and the code. Call this FIRST when the user wants a trading agent, then ask one question.', inputSchema: {} },
     wrap(async () => (await api<Array<Record<string, unknown>>>('/api/net/strategies')).map(({ code, ...m }) => ({ ...m, codeChars: String(code).length }))));
+  // The setup as a small form (MCP elicitation): 4 choices, then the agents start on demo money. Clients without forms
+  // get the options back so the AI asks with its own multiple-choice buttons.
+  server.registerTool('quick_setup', {
+    description: 'START HERE when the user wants trading agents: shows the user a short form (strategy, risk, how many, goal) and starts the agents on demo money. If it returns needsQuestions, ask those exact questions with your multiple-choice/question tool (never as a text list), then call quick_setup again with the answers.',
+    inputSchema: {
+      ai_model: z.string().min(2).max(40).describe('YOUR exact model, e.g. "Opus 5.5".'),
+      strategy: z.enum(['trend', 'burst', 'spike', 'mix']).optional(), risk: z.enum(['careful', 'balanced', 'aggressive', 'degen']).optional(),
+      count: z.number().int().min(1).max(10).optional(), goal: z.enum(['none', '+10% / 30 days', '2x / 7 days', '10x / 7 days']).optional(),
+      checkin_minutes: z.number().int().min(5).max(1440).optional(),
+    },
+  }, wrap(async (a) => {
+    const menu = await api<Array<{ key: string; name: string; confidence: number; coins: string[]; code: string; params: Record<string, unknown>; why: string }>>('/api/net/strategies');
+    let pick: { strategy?: string; risk?: string; count?: number; goal?: string } = { strategy: a.strategy, risk: a.risk, count: a.count, goal: a.goal };
+    const missing = !pick.strategy || !pick.risk || !pick.count || !pick.goal;
+    if (missing && server.server.getClientCapabilities()?.elicitation) {
+      const r = await server.server.elicitInput({
+        message: 'New PaperQuants agents (demo money, nothing real)',
+        requestedSchema: { type: 'object', required: ['strategy', 'risk', 'count', 'goal'], properties: {
+          strategy: { type: 'string', title: 'Strategy', enum: [...menu.map((m) => m.key), 'mix'], enumNames: [...menu.map((m) => `${m.name} · confidence ${m.confidence}`), 'A mix of all'] },
+          risk: { type: 'string', title: 'Risk', enum: ['careful', 'balanced', 'aggressive', 'degen'], enumNames: ['Careful · up to 100×', 'Balanced · up to 300×', 'Aggressive · up to 500×', 'Degen · up to 1000×'] },
+          count: { type: 'number', title: 'How many agents', minimum: 1, maximum: 10, default: 1 },
+          goal: { type: 'string', title: 'Goal', enum: ['none', '+10% / 30 days', '2x / 7 days', '10x / 7 days'] },
+        } },
+      } as never);
+      if (r.action !== 'accept' || !r.content) return { cancelled: true, note: 'The user closed the form. Ask if they want to try again.' };
+      pick = { ...pick, ...(r.content as typeof pick) };
+    } else if (missing) {
+      return { needsQuestions: true, ask: [
+        { question: 'Which strategy?', options: [...menu.map((m) => `${m.key}: ${m.name} (confidence ${m.confidence})`), 'mix: a different one per agent'] },
+        { question: 'Which risk level?', options: ['careful: up to 100×', 'balanced: up to 300×', 'aggressive: up to 500×', 'degen: up to 1000×'] },
+        { question: 'How many agents?', options: ['1', '3', '5', '10'] },
+        { question: 'Goal?', options: ['none', '+10% / 30 days', '2x / 7 days', '10x / 7 days'] },
+      ], then: 'Ask these 4 with your multiple-choice question tool in one go, then call quick_setup again with strategy, risk, count and goal.' };
+    }
+    const goals: Record<string, { mult: number; days: number } | null> = { none: null, '+10% / 30 days': { mult: 1.1, days: 30 }, '2x / 7 days': { mult: 2, days: 7 }, '10x / 7 days': { mult: 10, days: 7 } };
+    const g = goals[pick.goal ?? 'none'] ?? null;
+    const n = Math.min(Math.max(Number(pick.count) || 1, 1), 10);
+    const names = [...NAMES].sort(() => Math.random() - 0.5);
+    const made = [];
+    for (let i = 0; i < n; i++) {
+      const m = pick.strategy === 'mix' ? menu[i % menu.length] : menu.find((x) => x.key === pick.strategy) ?? menu[0];
+      const preset = PRESETS[(pick.risk as keyof typeof PRESETS) ?? 'balanced'];
+      // Variations so several agents of one strategy don't all make the same trade.
+      const params = { ...m.params, ...(n > 1 && i > 0 ? jitter(m.params, i) : {}) };
+      // Trend Rider trades at low leverage by design: the DEGEN 500× floor would block it, so it keeps the preset's caps without it.
+      const limits = { capitalUsd: 1000, coins: m.coins, ...preset, ...(m.key === 'trend' ? { riskProfile: null } : {}) };
+      made.push(await engine('/agents', { name: names[i], thesis: m.why, code: m.code, params, limits, mode: 'demo', userApproved: true, model: modelLabel(clientApp(server), a.ai_model),
+        settings: { goal: g ? { startUsd: 1000, targetUsd: Math.round(1000 * g.mult), days: g.days } : undefined, checkinMinutes: a.checkin_minutes ?? 10 } }).catch((e) => ({ error: (e as Error).message, name: names[i] })));
+    }
+    return { created: made.map((x: any) => ({ id: x.id, name: x.name, error: x.error })), next: 'Tell the user in 2 lines: the agent names, demo money, and that you check in every 10 minutes. Then schedule the check-ins.' };
+  }));
+
   server.registerTool('create_trading_agent', {
     description: "Start an agent that runs the strategy code every second within the limits. Default mode is demo: $1,000 of demo money on live prices, no wallet, nothing real traded, so create it as soon as the user picks a strategy and a limit preset. mode live (real money, its own wallet) only after explicit approval; use go_live for a demo agent that did well.",
     inputSchema: {

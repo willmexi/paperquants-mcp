@@ -129,7 +129,7 @@ export async function runMcp(): Promise<void> {
       mode: z.enum(['demo', 'live']).default('demo').describe('demo (default) = demo money, no wallet. live = real money on its own wallet.'),
       goal: z.object({ start_usd: z.number().positive().optional(), target_usd: z.number().positive(), days: z.number().positive() }).optional().describe('The user\'s goal, e.g. $1,000 → $5,000 in 7 days. Shown on the site; check-ins report ahead/behind pace.'),
       rules: z.string().max(2000).optional().describe('The user\'s own rules in their words (also baked into the code), e.g. "only US hours, max 3 trades a day".'),
-      checkin_minutes: z.number().int().min(5).max(1440).optional().describe('How often you check in on this agent (default 30).'),
+      checkin_minutes: z.number().int().min(5).max(1440).optional().describe('How often you check in on this agent (default 10).'),
       wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe("Live only: this agent's OWN wallet (from new_agent_wallet or connect_external_wallet). One agent per wallet, never shared."), user_approved: z.boolean() },
   }, wrap(async ({ user_approved, preset, limits: l, ai_model, strategy, goal, rules, checkin_minutes, ...a }) => {
     if (strategy) {
@@ -142,7 +142,7 @@ export async function runMcp(): Promise<void> {
     return engine('/agents', {
     ...a, limits: { capitalUsd: 1000, coins: ['BTC', 'ETH'], ...(preset ? PRESETS[preset] : PRESETS.balanced), ...(l ?? {}) },
     userApproved: a.mode === 'demo' ? true : user_approved, model: modelLabel(clientApp(server), ai_model),
-    settings: { goal: goal ? { startUsd: goal.start_usd ?? l?.capitalUsd ?? 1000, targetUsd: goal.target_usd, days: goal.days } : undefined, rules, checkinMinutes: checkin_minutes ?? 30 },
+    settings: { goal: goal ? { startUsd: goal.start_usd ?? l?.capitalUsd ?? 1000, targetUsd: goal.target_usd, days: goal.days } : undefined, rules, checkinMinutes: checkin_minutes ?? 10 },
   }); }));
   server.registerTool('engine_settings', { description: 'Engine settings on this computer: priority low (default, keeps the computer responsive) or normal, and keep_awake (stop sleep while trades are open). Omit both to read them.', inputSchema: { priority: z.enum(['low', 'normal']).optional(), keep_awake: z.boolean().optional() } },
     wrap(async ({ priority, keep_awake }) => (priority || keep_awake !== undefined ? engine('/config', { priority, keepAwake: keep_awake }) : engine('/config'))));

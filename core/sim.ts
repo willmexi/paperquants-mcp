@@ -1,6 +1,8 @@
 import { isOffHours, type Coin, type Side } from './papertrade.ts';
 import { settleVenue, liqMove, maxLeverage, maxNotional, fundingPayment, type Venue } from './venues.ts';
 
+export const PT_MIN_MARGIN = 10;
+export const PT_MIN_NOTIONAL = 500;
 export const MIN_MARGIN = 1;
 const MAX_OPEN_POSITIONS = 20;
 
@@ -189,6 +191,9 @@ export class Account {
     if (!Number.isFinite(margin)) return 'margin or marginPct required';
     margin = Math.min(margin, this.balance, maxNotional(venue) / leverage);
     if (margin < MIN_MARGIN) return `margin below $${MIN_MARGIN} (balance ${this.balance.toFixed(2)})`;
+    // Papertrade's own minimums (GET /state/trading, 2026-10-27): margin ≥ $10 and position value (margin × leverage) ≥ $500.
+    if (venue === 'papertrade' && margin < PT_MIN_MARGIN) return `Papertrade minimum margin is $${PT_MIN_MARGIN} per trade (asked $${margin.toFixed(2)})`;
+    if (venue === 'papertrade' && margin * leverage < PT_MIN_NOTIONAL) return `Papertrade minimum position value is $${PT_MIN_NOTIONAL} (margin × leverage; asked $${(margin * leverage).toFixed(0)})`;
     const openCount = this.positions.length + this.pending.filter((p) => p.kind === 'open').length;
     if (openCount >= MAX_OPEN_POSITIONS) return `max ${MAX_OPEN_POSITIONS} open positions`;
     const veto = this.guard?.({ coin: a.coin, venue, side: a.side, leverage, margin, slBps: num(a.slBps) });

@@ -166,7 +166,7 @@ export class PapertradeAdapter implements VenueAdapter {
   readonly venue = 'papertrade';
   readonly address: Address;
   constructor(address: string) { this.address = getAddress(address); }
-  limits(): VenueLimits { return { maxLeverage: 1000, minMarginUsd: 1, coins: ['BTC', 'ETH'], nativeExits: false }; }
+  limits(): VenueLimits { return { maxLeverage: 1000, minMarginUsd: 10, coins: ['BTC', 'ETH'], nativeExits: false }; } // Papertrade: margin ≥ $10, margin × leverage ≥ $500
   private rec() { return findWallet(this.address); }
   ready(): boolean {
     const w = this.rec();

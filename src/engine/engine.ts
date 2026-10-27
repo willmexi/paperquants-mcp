@@ -5,7 +5,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { setPriority as osSetPriority } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
-import { Account, summarize, type AccountSnapshot, type ClosedTrade } from '../../core/sim.ts';
+import { Account, summarize, PT_MIN_MARGIN, PT_MIN_NOTIONAL, type AccountSnapshot, type ClosedTrade } from '../../core/sim.ts';
 import { StrategyRuntime } from '../../core/sandbox.ts';
 import { checkOrder, degenFloor, DEFAULT_LIMITS } from '../../core/riskCore.ts';
 import { rawToUsd, type LivePosition } from '../../core/live/papertrade.ts';
@@ -162,8 +162,9 @@ export class Engine {
       if (snap) margin = Math.min(margin, Math.floor(snap.availableUsd * 100) / 100);
       const m: Mirror = { simId: p.id, coin: p.coin, side: p.side, leverage: Math.round(p.leverage), marginUsd: margin, status: 'opening', openedAt: now };
       a.rec.mirrors.push(m);
-      if (margin < venue.limits().minMarginUsd) {
-        m.status = 'failed'; m.error = `real margin $${margin} under Papertrade's $1 minimum`;
+      if (margin < PT_MIN_MARGIN || margin * m.leverage < PT_MIN_NOTIONAL) {
+        m.status = 'failed'; m.error = `real size too small for Papertrade (margin $${margin}, position $${(margin * m.leverage).toFixed(0)}; minimums $${PT_MIN_MARGIN} margin and $${PT_MIN_NOTIONAL} position value): fund the wallet more or size up`;
+        this.note(a, m.error);
         continue;
       }
       void venue.open(p.coin, p.side, margin, m.leverage)

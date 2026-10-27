@@ -217,6 +217,14 @@ export async function walletSnapshot(wallet: Address, timeoutMs = 15_000): Promi
   }
 }
 
+/** Papertrade's live trading rules: minimum margin and position value, max leverage, and whether trading is paused. */
+export async function tradingRules(): Promise<{ minMarginUsd: number; minNotionalUsd: number; maxLeverage: number; paused: boolean; winFeePct: number }> {
+  const r = await fetch(`${API}/state/trading`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(10_000) });
+  if (!r.ok) throw new Error(`trading rules HTTP ${r.status}`);
+  const d = (await r.json()) as { minimumTradeSizeRaw: string; minimumOpenNotionalRaw: string; maximumLeverage?: number; tradingPaused: boolean; winFeeRateRaw: string };
+  return { minMarginUsd: rawToUsd(d.minimumTradeSizeRaw), minNotionalUsd: rawToUsd(d.minimumOpenNotionalRaw), maxLeverage: d.maximumLeverage ?? 1000, paused: !!d.tradingPaused, winFeePct: rawToUsd(d.winFeeRateRaw) * 100 };
+}
+
 /** Closed trades from Papertrade's indexer (newest first). */
 export async function closedTrades(wallet: Address, limit = 75, cursor?: string): Promise<{ items: any[]; nextCursor: string | null }> {
   // The indexer only accepts a lowercase address and limit=75 (anything else: "path and query must contain only this

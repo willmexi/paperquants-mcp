@@ -117,5 +117,9 @@ export async function runMcp(): Promise<void> {
   server.registerTool('kill_all', { description: 'Emergency stop: closes every position the engine opened and blocks all new trades until switched off (on=false).', inputSchema: { on: z.boolean().default(true) } },
     wrap(async ({ on }) => engine('/kill', { on })));
 
+  // A slash command in Claude Code (/mcp__paperquants__start) and a prompt in the Claude app: the guided setup.
+  server.registerPrompt('start', { description: 'Set me up with PaperQuants (guided, one step at a time)' },
+    () => ({ messages: [{ role: 'user', content: { type: 'text', text: 'Set me up with PaperQuants. Check my status and tell me the one next step.' } }] }));
+
   await server.connect(new StdioServerTransport());
 }

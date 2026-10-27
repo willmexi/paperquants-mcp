@@ -12,8 +12,8 @@ if (cmd === 'mcp') {
   const { Engine } = await import('./engine/engine.ts');
   const { serve } = await import('./engine/http.ts');
   const e = new Engine();
+  serve(e); // answer right away; the engine finishes starting in the background
   await e.start();
-  serve(e);
   console.error(`[paperquants] engine ${VERSION} on 127.0.0.1:${ENGINE_PORT}`);
   const stop = () => { e.stop(); process.exit(0); };
   process.on('SIGINT', stop);

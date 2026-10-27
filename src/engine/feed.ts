@@ -29,15 +29,8 @@ export class LocalFeed extends EventEmitter implements MarketView {
   private timers: NodeJS.Timeout[] = [];
 
   async start(): Promise<void> {
-    const now = Date.now();
-    for (const c of COINS) {
-      const cs = await fetchCandles(c, now - 5000 * 60_000, now, '1m').catch(() => []);
-      this.books.get(c)!.seed(cs);
-      // Pre-load the 1-minute closes as 1-second history so strategies have context right away (coarse but contiguous).
-      const s = this.hist.get(c)!;
-      for (const k of cs.slice(-360)) for (let i = 0; i < 60; i++) s.push(k.c);
-      void this.refreshBars(c);
-    }
+    // Seed history in the background: the engine must answer Claude right away; live prices arrive within a second.
+    void this.seed();
     this.connect();
     let lastSecond = 0;
     this.timers.push(setInterval(() => {
@@ -56,6 +49,19 @@ export class LocalFeed extends EventEmitter implements MarketView {
       if (this.connected && Date.now() - this.lastMessageAt > 60_000) this.ws?.close();
     }, 30_000));
     this.timers.push(setInterval(() => { for (const c of COINS) void this.refreshBars(c); }, 5 * 60_000));
+  }
+
+  private async seed(): Promise<void> {
+    const now = Date.now();
+    await Promise.all(COINS.map(async (c) => {
+      const cs = await fetchCandles(c, now - 5000 * 60_000, now, '1m').catch(() => []);
+      this.books.get(c)!.seed(cs);
+      // Pre-load the 1-minute closes as 1-second history so strategies have context (coarse but contiguous), unless
+      // live seconds already arrived.
+      const s = this.hist.get(c)!;
+      if (!s.length) for (const k of cs.slice(-360)) for (let i = 0; i < 60; i++) s.push(k.c);
+      await this.refreshBars(c);
+    }));
   }
 
   stop(): void {

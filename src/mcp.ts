@@ -130,7 +130,7 @@ export async function runMcp(): Promise<void> {
   // The setup as a small form (MCP elicitation): 4 choices, then the agents start on demo money. Clients without forms
   // get the options back so the AI asks with its own multiple-choice buttons.
   server.registerTool('quick_setup', {
-    description: 'START HERE when the user wants trading agents (call it right away, no "shall I?"). First call returns 4 questions: ask them at once with your multiple-choice question tool using the exact labels, then call again with strategy, risk, count and goal to start the agents on demo money.',
+    description: 'START HERE when the user wants trading agents (call it right away, no "shall I?"). The first call researches live (re-tests every strategy on the last 24h and 3 days of 1-second data, reads the market; ~10–30 s) and returns 4 questions with fresh confidence scores: ask them at once with your multiple-choice question tool, then call again with strategy, risk, count and goal to start the agents on demo money.',
     inputSchema: {
       ai_model: z.string().min(2).max(40).describe('YOUR exact model, e.g. "Opus 5.5".'),
       strategy: z.enum(['trend', 'burst', 'spike', 'mix']).optional(), risk: z.enum(['careful', 'balanced', 'aggressive', 'degen']).optional(),
@@ -138,13 +138,16 @@ export async function runMcp(): Promise<void> {
       checkin_minutes: z.number().int().min(5).max(1440).optional(),
     },
   }, wrap(async (a) => {
-    const menu = await api<Array<{ key: string; name: string; confidence: number; coins: string[]; code: string; params: Record<string, unknown>; why: string }>>('/api/net/strategies');
+    const menu = await api<Array<{ key: string; name: string; confidence: number; short?: string; coins: string[]; code: string; params: Record<string, unknown>; why: string }>>('/api/net/strategies');
     let pick: { strategy?: string; risk?: string; count?: number; goal?: string } = { strategy: a.strategy, risk: a.risk, count: a.count, goal: a.goal };
     const missing = !pick.strategy || !pick.risk || !pick.count || !pick.goal;
     if (missing) {
-      // Ask with the AI's own multiple-choice buttons (MCP pop-up forms are unreliable across apps).
-      return { needsQuestions: true, useExactly: true, ask: [
-        { question: 'Which strategy?', header: 'Strategy', options: [...menu.map((m) => ({ value: m.key, label: `${m.name} · confidence ${m.confidence}`, description: m.why.split('. ')[0].slice(0, 110) })),
+      // Fresh research every time: re-test each strategy on the last 24 h and 3 days of 1-second data, read the market.
+      const live = await api<{ at: string; market: Array<{ coin: string; price: number | null; change24hPct: number | null; trend: string; fundingPctPerHour: number }>; strategies: Array<{ key: string; name: string; confidence: number; short?: string; summary: string }> }>('/api/net/research-now', { method: 'POST', auth: true, body: {}, timeoutMs: 180_000 });
+      return { needsQuestions: true, useExactly: true, researchedAt: live.at,
+        market: live.market.map((m) => `${m.coin} ${m.price ?? '?'} (${m.change24hPct != null ? `${m.change24hPct >= 0 ? '+' : ''}${m.change24hPct}%` : '?'} 24h, trend ${m.trend})`).join(' · '),
+        ask: [
+        { question: 'Which strategy? (re-tested just now)', header: 'Strategy', options: [...live.strategies.map((m) => ({ value: m.key, label: `${m.name} · confidence ${m.confidence}`, description: `${m.short ?? ''} · ${m.summary}`.slice(0, 160) })),
           { value: 'mix', label: 'Mix', description: 'A different strategy per agent, to compare them' }] },
         { question: 'Which risk level?', header: 'Risk', options: [
           { value: 'careful', label: 'Careful', description: 'Up to 100×, 10% per trade, stops after −20% in a day' },
@@ -153,7 +156,7 @@ export async function runMcp(): Promise<void> {
           { value: 'degen', label: 'Degen', description: 'Up to 1000×, 50% per trade, moon or dust' }] },
         { question: 'How many agents?', header: 'Agents', options: [{ value: 1, label: '1' }, { value: 3, label: '3' }, { value: 5, label: '5' }, { value: 10, label: '10' }] },
         { question: 'Goal?', header: 'Goal', options: [{ value: 'none', label: 'No goal' }, { value: '+10% / 30 days', label: '+10% in 30 days' }, { value: '2x / 7 days', label: '2× in 7 days' }, { value: '10x / 7 days', label: '10× in 7 days' }] },
-      ], then: 'Ask all 4 at once with your multiple-choice question tool, using these labels and descriptions exactly (no extra text before it), then call quick_setup again with the chosen values.' };
+      ], then: 'Say the market line in one sentence, then ask all 4 at once with your multiple-choice question tool using these labels and descriptions exactly, then call quick_setup again with the chosen values (no new research needed).' };
     }
     const goals: Record<string, { mult: number; days: number } | null> = { none: null, '+10% / 30 days': { mult: 1.1, days: 30 }, '2x / 7 days': { mult: 2, days: 7 }, '10x / 7 days': { mult: 10, days: 7 } };
     const g = goals[pick.goal ?? 'none'] ?? null;
@@ -167,10 +170,14 @@ export async function runMcp(): Promise<void> {
       const params = { ...m.params, ...(n > 1 && i > 0 ? jitter(m.params, i) : {}) };
       // Trend Rider trades at low leverage by design: the DEGEN 500× floor would block it, so it keeps the preset's caps without it.
       const limits = { capitalUsd: 1000, coins: m.coins, ...preset, ...(m.key === 'trend' ? { riskProfile: null } : {}) };
-      made.push(await engine('/agents', { name: names[i], thesis: m.why, code: m.code, params, limits, mode: 'demo', userApproved: true, model: modelLabel(clientApp(server), a.ai_model),
+      made.push(await engine('/agents', { name: names[i], strategyName: m.name, thesis: m.why, code: m.code, params, limits, mode: 'demo', userApproved: true, model: modelLabel(clientApp(server), a.ai_model),
         settings: { goal: g ? { startUsd: 1000, targetUsd: Math.round(1000 * g.mult), days: g.days } : undefined, checkinMinutes: a.checkin_minutes ?? 10 } }).catch((e) => ({ error: (e as Error).message, name: names[i] })));
     }
-    return { created: made.map((x: any) => ({ id: x.id, name: x.name, error: x.error })), next: 'Tell the user in 2 lines: the agent names, demo money, and that you check in every 10 minutes. Then schedule the check-ins.' };
+    return {
+      created: made.map((x: any, i) => ({ id: x.id, name: x.name, strategy: pick.strategy === 'mix' ? menu[i % menu.length].name : (menu.find((m) => m.key === pick.strategy) ?? menu[0]).name, error: x.error })),
+      demoMoneyEach: 1000, risk: pick.risk, goal: pick.goal, checkinMinutes: a.checkin_minutes ?? 10,
+      next: 'Tell the user in 2 short lines: each agent name with its strategy, $1,000 demo money each, the risk and goal, and that you check in every 10 minutes. Then schedule the check-ins.',
+    };
   }));
 
   server.registerTool('create_trading_agent', {

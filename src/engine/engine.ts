@@ -28,7 +28,7 @@ type MirrorStatus = 'opening' | 'open' | 'closing' | 'closed' | 'failed';
 interface Mirror { simId: number; coin: string; side: 'long' | 'short'; leverage: number; marginUsd: number; intentId?: string; positionId?: string; entry?: number; status: MirrorStatus; openedAt: number; closedAt?: number; pnlUsd?: number; error?: string }
 
 export interface AgentRecord {
-  id: string; netId?: number; mode?: 'demo' | 'live'; wallet: string; name: string; thesis: string; code: string; params: Record<string, unknown>; limits: Limits;
+  id: string; netId?: number; mode?: 'demo' | 'live'; wallet: string; name: string; strategyName?: string; thesis: string; code: string; params: Record<string, unknown>; limits: Limits;
   status: 'running' | 'paused' | 'stopped'; pausedReason?: string; createdAt: number; model?: string;
   realEquity: number; day: { date: string; start: number }; account?: AccountSnapshot; mirrors: Mirror[]; log: string[];
   recent?: Array<{ openedAt: number; closedAt: number; coin: string; side: string; lev: number; entry: number; exit: number; pnl: number; bps: number; reason: string }>;
@@ -74,6 +74,7 @@ function cleanSettings(s: AgentSettings | undefined, capital: number): AgentSett
 export class Engine {
   feed = new LocalFeed();
   live = new Map<string, Live>();
+  startedAt = Date.now();
   killSwitch = readJson<{ on: boolean }>('kill.json', { on: false }).on;
   snaps = new Map<string, Snap>(); // per wallet (one agent per wallet)
   private lastKeyTry = new Map<string, number>();
@@ -265,7 +266,7 @@ export class Engine {
 
   // ---------- control (called by the local HTTP API that the MCP tools use) ----------
 
-  async createAgent(input: { name: string; thesis: string; code: string; params?: Record<string, unknown>; limits: Partial<Limits>; mode?: 'demo' | 'live'; wallet?: string; userApproved: boolean; model?: string; settings?: AgentSettings }) {
+  async createAgent(input: { name: string; thesis: string; code: string; params?: Record<string, unknown>; limits: Partial<Limits>; mode?: 'demo' | 'live'; wallet?: string; userApproved: boolean; model?: string; settings?: AgentSettings; strategyName?: string }) {
     if (input.userApproved !== true) throw new Error('refused: the user has not approved this agent. Present the research and the limits, and ask them first.');
     if (this.killSwitch) throw new Error('the kill switch is on: switch it off first');
     const demo = input.mode === 'demo';
@@ -274,7 +275,7 @@ export class Engine {
     const limits = validateLimits(input.limits);
     new StrategyRuntime(input.code, input.params ?? {}, []); // compile check
     const rec: AgentRecord = {
-      id: randomUUID().slice(0, 8), mode: demo ? 'demo' : 'live', wallet: w?.address ?? '', name: String(input.name).slice(0, 60), thesis: String(input.thesis ?? '').slice(0, 2000), code: input.code, params: input.params ?? {},
+      id: randomUUID().slice(0, 8), mode: demo ? 'demo' : 'live', wallet: w?.address ?? '', name: String(input.name).slice(0, 60), strategyName: input.strategyName ? String(input.strategyName).slice(0, 60) : undefined, thesis: String(input.thesis ?? '').slice(0, 2000), code: input.code, params: input.params ?? {},
       limits, settings: cleanSettings(input.settings, limits.capitalUsd), status: 'running', createdAt: Date.now(), model: input.model, realEquity: limits.capitalUsd, day: { date: today(), start: limits.capitalUsd }, mirrors: [], log: [],
     };
     this.instantiate(rec);
@@ -295,7 +296,7 @@ export class Engine {
   /** Report the agent to PaperQuants (shown on the user's account page; live ones also on the verified leaderboard). */
   private register(rec: AgentRecord): void {
     if (!session()) return;
-    const strategy = { name: rec.name, code: rec.code, params: rec.params, hash: createHash('sha256').update(rec.code + JSON.stringify(rec.params)).digest('hex').slice(0, 16) };
+    const strategy = { name: rec.strategyName ?? rec.name, code: rec.code, params: rec.params, hash: createHash('sha256').update(rec.code + JSON.stringify(rec.params)).digest('hex').slice(0, 16) };
     api<{ id: number }>('/api/net/agents', { auth: true, body: { name: rec.name, venue: 'papertrade', mode: isDemo(rec) ? 'demo' : 'live', wallet: rec.wallet || null, strategy, limits: rec.limits, settings: rec.settings ?? {}, model: rec.model } })
       .then((r) => { rec.netId = r.id; this.persist(); void this.heartbeat(); }).catch(() => {});
   }
@@ -392,13 +393,13 @@ export class Engine {
   list() {
     return [...this.live.keys()].map((id) => {
       const d = this.describe(id);
-      return { id: d.id, name: d.name, mode: d.mode, wallet: d.wallet, liveTrading: d.liveTrading, status: d.status, pausedReason: d.pausedReason, realEquityUsd: d.realEquityUsd, paperPnlPct: Math.round(d.paper.pnlPct * 10) / 10, trades: d.paper.trades, open: d.open.length };
+      return { id: d.id, name: d.name, strategy: this.live.get(id)?.rec.strategyName ?? 'custom', mode: d.mode, equityUsd: d.realEquityUsd ?? d.demoEquityUsd, wallet: d.wallet, liveTrading: d.liveTrading, status: d.status, pausedReason: d.pausedReason, realEquityUsd: d.realEquityUsd, paperPnlPct: Math.round(d.paper.pnlPct * 10) / 10, trades: d.paper.trades, open: d.open.length };
     });
   }
 
   status() {
     return {
-      feed: { connected: this.feed.connected, btc: this.feed.quote('BTC')?.mid, eth: this.feed.quote('ETH')?.mid },
+      feed: { state: this.feed.connected ? 'live' : Date.now() - this.startedAt < 30_000 ? 'connecting' : 'reconnecting', connected: this.feed.connected, btc: this.feed.quote('BTC')?.mid, eth: this.feed.quote('ETH')?.mid },
       masterAccount: session()?.wallet ?? null,
       wallets: this.wallets(), killSwitch: this.killSwitch, keepingAwake: !!this.awake, agents: this.list(),
     };

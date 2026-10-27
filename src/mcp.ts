@@ -114,21 +114,32 @@ export async function runMcp(): Promise<void> {
     wrap(async () => api('/api/net/research?mine=1', { auth: true })));
 
   // ---- agents (local engine) ----
-  server.registerTool('create_agent', {
+  server.registerTool('strategy_menu', { description: 'Ready-to-run PaperQuants strategies with honest confidence scores (0–100), why, coins, suggested risk preset and the code. Call this FIRST when the user wants a trading agent, then ask one question.', inputSchema: {} },
+    wrap(async () => (await api<Array<Record<string, unknown>>>('/api/net/strategies')).map(({ code, ...m }) => ({ ...m, codeChars: String(code).length }))));
+  server.registerTool('create_trading_agent', {
     description: "Start an agent that runs the strategy code every second within the limits. Default mode is demo: $1,000 of demo money on live prices, no wallet, nothing real traded, so create it as soon as the user picks a strategy and a limit preset. mode live (real money, its own wallet) only after explicit approval; use go_live for a demo agent that did well.",
     inputSchema: {
       name: z.string().min(3).max(24).regex(/^[A-Za-z0-9 ]+$/).refine((n) => !/\b(demo|live|test|agent|bot)\b/i.test(n), 'no demo/live/test/agent/bot in the name: the site shows the mode itself')
         .describe('A short, memorable name of 1–3 words, like "Night Owl" or "Spike Fader". No "demo"/"live", no leverage numbers.'),
       ai_model: z.string().min(2).max(40).describe('YOUR exact model name and version, e.g. "Opus 5.5", "Sonnet 5.5", "GPT-5". Shown on the website as "<username>-<app> · <model>".'),
-      thesis: z.string().describe('Why it should make money and what would prove it wrong.'), code: z.string(), params: z.record(z.string(), z.any()).optional(),
+      strategy: z.string().optional().describe('A strategy_menu key (e.g. "trend"): uses its code and params, no code needed.'),
+      thesis: z.string().optional().describe('Why it should make money and what would prove it wrong (taken from the menu if strategy is set).'), code: z.string().optional(), params: z.record(z.string(), z.any()).optional(),
       preset: z.enum(['careful', 'balanced', 'aggressive', 'degen']).optional().describe('careful 100× / 10% per trade / 20% daily stop · balanced 300× / 25% / 35% · aggressive 500× / 40% / 50% · degen 1000× / 50% / 70%. Coins and capital still apply.'),
       limits: limits.partial().optional().describe('Overrides on top of the preset. Defaults: capitalUsd 1000 (demo money), coins BTC+ETH.'),
       mode: z.enum(['demo', 'live']).default('demo').describe('demo (default) = demo money, no wallet. live = real money on its own wallet.'),
       wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe("Live only: this agent's OWN wallet (from new_agent_wallet or connect_external_wallet). One agent per wallet, never shared."), user_approved: z.boolean() },
-  }, wrap(async ({ user_approved, preset, limits: l, ai_model, ...a }) => engine('/agents', {
+  }, wrap(async ({ user_approved, preset, limits: l, ai_model, strategy, ...a }) => {
+    if (strategy) {
+      const m = (await api<Array<{ key: string; code: string; params: Record<string, unknown>; why: string; coins: string[] }>>('/api/net/strategies')).find((x) => x.key === strategy);
+      if (!m) throw new Error(`no strategy "${strategy}" in strategy_menu`);
+      a.code = m.code; a.params = { ...m.params, ...(a.params ?? {}) }; a.thesis ??= m.why;
+      l = { coins: m.coins as never, ...(l ?? {}) };
+    }
+    if (!a.code) throw new Error('pass strategy (a strategy_menu key) or your own code');
+    return engine('/agents', {
     ...a, limits: { capitalUsd: 1000, coins: ['BTC', 'ETH'], ...(preset ? PRESETS[preset] : PRESETS.balanced), ...(l ?? {}) },
     userApproved: a.mode === 'demo' ? true : user_approved, model: modelLabel(clientApp(server), ai_model),
-  })));
+  }); }));
   server.registerTool('go_live', {
     description: "Switch a demo agent to real money on its own wallet (same strategy and limits; capitalUsd can be set). Only after the user saw its demo results and explicitly approved real money.",
     inputSchema: { id: z.string(), wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/), capital_usd: z.number().positive().optional(), user_approved: z.boolean() },

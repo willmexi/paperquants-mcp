@@ -4,7 +4,7 @@
 // the machine awake while real positions are open.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { Account, summarize, type AccountSnapshot } from '../../core/sim.ts';
+import { Account, summarize, type AccountSnapshot, type ClosedTrade } from '../../core/sim.ts';
 import { StrategyRuntime } from '../../core/sandbox.ts';
 import { checkOrder, degenFloor, DEFAULT_LIMITS } from '../../core/riskCore.ts';
 import { rawToUsd, type LivePosition } from '../../core/live/papertrade.ts';
@@ -30,6 +30,8 @@ export interface AgentRecord {
   id: string; netId?: number; mode?: 'demo' | 'live'; wallet: string; name: string; thesis: string; code: string; params: Record<string, unknown>; limits: Limits;
   status: 'running' | 'paused' | 'stopped'; pausedReason?: string; createdAt: number; model?: string;
   realEquity: number; day: { date: string; start: number }; account?: AccountSnapshot; mirrors: Mirror[]; log: string[];
+  recent?: Array<{ openedAt: number; closedAt: number; coin: string; side: string; lev: number; entry: number; exit: number; pnl: number; bps: number; reason: string }>;
+  curve?: number[]; // equity every 5 minutes (last 2 days), shown on the website
 }
 
 interface Live { rec: AgentRecord; runtime: StrategyRuntime; account: Account; venue: VenueAdapter | null; lastRejected?: string }
@@ -72,7 +74,7 @@ export class Engine {
       try { this.instantiate(rec); } catch (e) { rec.status = 'stopped'; rec.pausedReason = `failed to load: ${(e as Error).message}`; this.instantiate(rec, true); }
     }
     this.feed.on('quote', (coin: Coin, q: { mid: number; t: number }) => {
-      for (const a of this.live.values()) if (a.rec.status === 'running') a.account.onPrice(coin, q.mid, q.t);
+      for (const a of this.live.values()) if (a.rec.status === 'running') this.closed(a, a.account.onPrice(coin, q.mid, q.t));
     });
     this.feed.on('second', (t: number) => this.onSecond(t));
     this.timers.push(setInterval(() => void this.reconcile().catch((e) => this.note(null, `reconcile: ${(e as Error).message}`)), 5000));
@@ -114,7 +116,7 @@ export class Engine {
       if (a.rec.status !== 'running') continue;
       for (const c of a.rec.limits.coins) {
         const q = this.feed.quote(c);
-        if (q) a.account.onPrice(c, q.mid, t);
+        if (q) this.closed(a, a.account.onPrice(c, q.mid, t));
       }
       const actions = a.runtime.tick(this.feed, a.account);
       if (actions.length) {
@@ -281,7 +283,7 @@ export class Engine {
     if (!session()) return;
     const strategy = { name: rec.name, code: rec.code, params: rec.params, hash: createHash('sha256').update(rec.code + JSON.stringify(rec.params)).digest('hex').slice(0, 16) };
     api<{ id: number }>('/api/net/agents', { auth: true, body: { name: rec.name, venue: 'papertrade', mode: isDemo(rec) ? 'demo' : 'live', wallet: rec.wallet || null, strategy, limits: rec.limits, model: rec.model } })
-      .then((r) => { rec.netId = r.id; this.persist(); }).catch(() => {});
+      .then((r) => { rec.netId = r.id; this.persist(); void this.heartbeat(); }).catch(() => {});
   }
 
   /** A demo agent that did well goes live on its own wallet: same strategy and limits, real money from now on. */
@@ -421,12 +423,34 @@ export class Engine {
     writeJson('agents.json', [...this.live.values()].map((a) => a.rec));
   }
 
-  private async heartbeat(): Promise<void> {
+  /** Remember closed trades (demo trades included) for the website. */
+  private closed(a: Live, trades: ClosedTrade[]): void {
+    if (!trades.length) return;
+    a.rec.recent ??= [];
+    for (const t of trades) a.rec.recent.push({ openedAt: t.openedAt, closedAt: t.closedAt, coin: t.coin, side: t.side, lev: t.leverage, entry: t.entry, exit: t.exit, pnl: Math.round(t.pnl * 100) / 100, bps: Math.round((t.side === 'long' ? t.exit - t.entry : t.entry - t.exit) / t.entry * 1e6) / 100, reason: t.reason });
+    if (a.rec.recent.length > 60) a.rec.recent.splice(0, a.rec.recent.length - 60);
+  }
+
+  /** Every minute: each agent's equity, positions, recent trades and curve go to PaperQuants for the website. */
+  private lastCurve = 0;
+  async heartbeat(): Promise<void> {
     if (!session()) return;
+    const tick = Date.now() - this.lastCurve > 5 * 60_000;
+    if (tick) this.lastCurve = Date.now();
     for (const a of this.live.values()) {
       if (!a.rec.netId) continue;
       const d = this.describe(a.rec.id);
-      await api(`/api/net/agents/${a.rec.netId}/heartbeat`, { auth: true, body: { equity: d.realEquityUsd ?? d.demoEquityUsd, open: d.realPositions.length, status: d.status } }).catch(() => {});
+      const equity = d.realEquityUsd ?? d.demoEquityUsd ?? 0;
+      a.rec.curve ??= [a.rec.limits.capitalUsd];
+      if (tick) { a.rec.curve.push(Math.round(equity * 100) / 100); if (a.rec.curve.length > 576) a.rec.curve.splice(0, a.rec.curve.length - 576); }
+      const now = Date.now(), mid = (c: Coin) => this.feed.quote(c)?.mid;
+      const positions = a.account.positions.map((p) => {
+        const mark = mid(p.coin) ?? p.entry, bps = ((p.side === 'long' ? mark - p.entry : p.entry - mark) / p.entry) * 1e4;
+        return { coin: p.coin, side: p.side, lev: p.leverage, margin: p.margin, entry: p.entry, mark, bps: Math.round(bps * 100) / 100, pnl: Math.round(p.margin * p.leverage * bps / 1e4 * 100) / 100, ageSec: Math.round((now - p.openedAt) / 1000) };
+      });
+      const snapshot = { stats: { trades: d.paper.trades, wins: d.paper.wins, winRate: d.paper.winRate, pnlPct: d.paper.pnlPct, maxDrawdownPct: d.paper.maxDrawdownPct },
+        positions, trades: (a.rec.recent ?? []).slice(-30), equity: [...a.rec.curve, Math.round(equity * 100) / 100].slice(-120), log: a.rec.log.slice(-6), thesis: a.rec.thesis, coins: a.rec.limits.coins };
+      await api(`/api/net/agents/${a.rec.netId}/heartbeat`, { auth: true, body: { equity, open: positions.length, status: d.status, snapshot } }).catch(() => {});
     }
   }
 }

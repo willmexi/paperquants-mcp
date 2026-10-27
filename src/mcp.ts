@@ -40,6 +40,14 @@ const limits = z.object({
   riskProfile: z.enum(['DEGEN']).optional().describe('DEGEN: every order must be 500×+ and at least 6% of equity.'),
 });
 
+/** Which AI app is driving us, from the MCP handshake (Claude Code, the Claude app, ChatGPT, Cursor...). */
+function clientApp(server: McpServer): string {
+  const n = (server.server.getClientVersion()?.name ?? '').toLowerCase();
+  return n.includes('claude') ? 'Claude' : n.includes('chatgpt') || n.includes('openai') ? 'ChatGPT' : n.includes('gemini') ? 'Gemini' : n.includes('cursor') ? 'Cursor' : n ? n.slice(0, 20) : 'AI';
+}
+/** "Claude · Opus 5.5": the app (forced from the handshake) plus the model the LLM reports. */
+const modelLabel = (app: string, model: string) => `${app} · ${model.replace(new RegExp(`^${app}\\s*`, 'i'), '').trim()}`;
+
 export async function runMcp(): Promise<void> {
   const server = new McpServer({ name: 'paperquants', version: VERSION }, { instructions: INSTRUCTIONS });
 
@@ -108,14 +116,18 @@ export async function runMcp(): Promise<void> {
   // ---- agents (local engine) ----
   server.registerTool('create_agent', {
     description: "Start an agent that runs the strategy code every second within the limits. Default mode is demo: $1,000 of demo money on live prices, no wallet, nothing real traded, so create it as soon as the user picks a strategy and a limit preset. mode live (real money, its own wallet) only after explicit approval; use go_live for a demo agent that did well.",
-    inputSchema: { name: z.string().min(2).max(60), thesis: z.string().describe('Why it should make money and what would prove it wrong.'), code: z.string(), params: z.record(z.string(), z.any()).optional(),
+    inputSchema: {
+      name: z.string().min(3).max(24).regex(/^[A-Za-z0-9 ]+$/).refine((n) => !/\b(demo|live|test|agent|bot)\b/i.test(n), 'no demo/live/test/agent/bot in the name: the site shows the mode itself')
+        .describe('A short, memorable name of 1–3 words, like "Night Owl" or "Spike Fader". No "demo"/"live", no leverage numbers.'),
+      ai_model: z.string().min(2).max(40).describe('YOUR exact model name and version, e.g. "Opus 5.5", "Sonnet 5.5", "GPT-5". Shown on the website as "<username>-<app> · <model>".'),
+      thesis: z.string().describe('Why it should make money and what would prove it wrong.'), code: z.string(), params: z.record(z.string(), z.any()).optional(),
       preset: z.enum(['careful', 'balanced', 'aggressive', 'degen']).optional().describe('careful 100× / 10% per trade / 20% daily stop · balanced 300× / 25% / 35% · aggressive 500× / 40% / 50% · degen 1000× / 50% / 70%. Coins and capital still apply.'),
       limits: limits.partial().optional().describe('Overrides on top of the preset. Defaults: capitalUsd 1000 (demo money), coins BTC+ETH.'),
       mode: z.enum(['demo', 'live']).default('demo').describe('demo (default) = demo money, no wallet. live = real money on its own wallet.'),
       wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe("Live only: this agent's OWN wallet (from new_agent_wallet or connect_external_wallet). One agent per wallet, never shared."), user_approved: z.boolean() },
-  }, wrap(async ({ user_approved, preset, limits: l, ...a }) => engine('/agents', {
+  }, wrap(async ({ user_approved, preset, limits: l, ai_model, ...a }) => engine('/agents', {
     ...a, limits: { capitalUsd: 1000, coins: ['BTC', 'ETH'], ...(preset ? PRESETS[preset] : PRESETS.balanced), ...(l ?? {}) },
-    userApproved: a.mode === 'demo' ? true : user_approved, model: 'claude',
+    userApproved: a.mode === 'demo' ? true : user_approved, model: modelLabel(clientApp(server), ai_model),
   })));
   server.registerTool('go_live', {
     description: "Switch a demo agent to real money on its own wallet (same strategy and limits; capitalUsd can be set). Only after the user saw its demo results and explicitly approved real money.",

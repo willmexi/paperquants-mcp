@@ -3,6 +3,7 @@
 // key, and enforces the limits the user agreed to. Papertrade has no TP/SL orders, so this loop IS the exit: it keeps
 // the machine awake while real positions are open.
 import { spawn, type ChildProcess } from 'node:child_process';
+import { setPriority as osSetPriority } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { Account, summarize, type AccountSnapshot, type ClosedTrade } from '../../core/sim.ts';
 import { StrategyRuntime } from '../../core/sandbox.ts';
@@ -32,8 +33,11 @@ export interface AgentRecord {
   realEquity: number; day: { date: string; start: number }; account?: AccountSnapshot; mirrors: Mirror[]; log: string[];
   recent?: Array<{ openedAt: number; closedAt: number; coin: string; side: string; lev: number; entry: number; exit: number; pnl: number; bps: number; reason: string }>;
   curve?: number[]; // equity every 5 minutes (last 2 days), shown on the website
+  settings?: AgentSettings;
 }
 
+/** What the user chose beyond limits: a goal to hit, their own rules in words, and how often their AI checks in. */
+export interface AgentSettings { goal?: { startUsd: number; targetUsd: number; days: number }; rules?: string; checkinMinutes?: number }
 interface Live { rec: AgentRecord; runtime: StrategyRuntime; account: Account; venue: VenueAdapter | null; lastRejected?: string }
 const isDemo = (r: AgentRecord) => r.mode === 'demo' || !r.wallet;
 interface Snap { at: number; balanceUsd: number; availableUsd: number; positions: LivePosition[] }
@@ -59,6 +63,14 @@ export function validateLimits(l: Partial<Limits>): Limits {
   };
 }
 
+function cleanSettings(s: AgentSettings | undefined, capital: number): AgentSettings {
+  const out: AgentSettings = {};
+  if (s?.goal && Number(s.goal.targetUsd) > 0 && Number(s.goal.days) > 0) out.goal = { startUsd: Number(s.goal.startUsd) || capital, targetUsd: Number(s.goal.targetUsd), days: Math.min(Math.max(Number(s.goal.days), 1), 365) };
+  if (s?.rules) out.rules = String(s.rules).slice(0, 2000);
+  if (s?.checkinMinutes) out.checkinMinutes = Math.min(Math.max(Math.round(Number(s.checkinMinutes)), 5), 1440);
+  return out;
+}
+
 export class Engine {
   feed = new LocalFeed();
   live = new Map<string, Live>();
@@ -69,6 +81,7 @@ export class Engine {
   private timers: NodeJS.Timeout[] = [];
 
   async start(): Promise<void> {
+    this.applyPriority();
     await this.feed.start();
     for (const rec of readJson<AgentRecord[]>('agents.json', [])) {
       try { this.instantiate(rec); } catch (e) { rec.status = 'stopped'; rec.pausedReason = `failed to load: ${(e as Error).message}`; this.instantiate(rec, true); }
@@ -251,7 +264,7 @@ export class Engine {
 
   // ---------- control (called by the local HTTP API that the MCP tools use) ----------
 
-  async createAgent(input: { name: string; thesis: string; code: string; params?: Record<string, unknown>; limits: Partial<Limits>; mode?: 'demo' | 'live'; wallet?: string; userApproved: boolean; model?: string }) {
+  async createAgent(input: { name: string; thesis: string; code: string; params?: Record<string, unknown>; limits: Partial<Limits>; mode?: 'demo' | 'live'; wallet?: string; userApproved: boolean; model?: string; settings?: AgentSettings }) {
     if (input.userApproved !== true) throw new Error('refused: the user has not approved this agent. Present the research and the limits, and ask them first.');
     if (this.killSwitch) throw new Error('the kill switch is on: switch it off first');
     const demo = input.mode === 'demo';
@@ -261,7 +274,7 @@ export class Engine {
     new StrategyRuntime(input.code, input.params ?? {}, []); // compile check
     const rec: AgentRecord = {
       id: randomUUID().slice(0, 8), mode: demo ? 'demo' : 'live', wallet: w?.address ?? '', name: String(input.name).slice(0, 60), thesis: String(input.thesis ?? '').slice(0, 2000), code: input.code, params: input.params ?? {},
-      limits, status: 'running', createdAt: Date.now(), model: input.model, realEquity: limits.capitalUsd, day: { date: today(), start: limits.capitalUsd }, mirrors: [], log: [],
+      limits, settings: cleanSettings(input.settings, limits.capitalUsd), status: 'running', createdAt: Date.now(), model: input.model, realEquity: limits.capitalUsd, day: { date: today(), start: limits.capitalUsd }, mirrors: [], log: [],
     };
     this.instantiate(rec);
     if (w) updateWallet(w.address, { agentId: rec.id, label: rec.name });
@@ -282,7 +295,7 @@ export class Engine {
   private register(rec: AgentRecord): void {
     if (!session()) return;
     const strategy = { name: rec.name, code: rec.code, params: rec.params, hash: createHash('sha256').update(rec.code + JSON.stringify(rec.params)).digest('hex').slice(0, 16) };
-    api<{ id: number }>('/api/net/agents', { auth: true, body: { name: rec.name, venue: 'papertrade', mode: isDemo(rec) ? 'demo' : 'live', wallet: rec.wallet || null, strategy, limits: rec.limits, model: rec.model } })
+    api<{ id: number }>('/api/net/agents', { auth: true, body: { name: rec.name, venue: 'papertrade', mode: isDemo(rec) ? 'demo' : 'live', wallet: rec.wallet || null, strategy, limits: rec.limits, settings: rec.settings ?? {}, model: rec.model } })
       .then((r) => { rec.netId = r.id; this.persist(); void this.heartbeat(); }).catch(() => {});
   }
 
@@ -353,6 +366,7 @@ export class Engine {
       open: a.account.positions.map((p) => ({ coin: p.coin, side: p.side, leverage: p.leverage, margin: p.margin, entry: p.entry, ageSec: Math.round((now - p.openedAt) / 1000) })),
       realPositions: a.rec.mirrors.filter((m) => m.status === 'open' || m.status === 'opening' || m.status === 'closing'),
       recentReal: a.rec.mirrors.filter((m) => m.status === 'closed' || m.status === 'failed').slice(-10),
+      settings: a.rec.settings, goalPace: this.pace(a.rec, isDemo(a.rec) ? paperEq : a.rec.realEquity),
       strategyErrors: a.runtime.errors, lastError: a.runtime.lastError, logs: a.runtime.logs.slice(-10), log: a.rec.log.slice(-15), thesis: a.rec.thesis,
     };
   }
@@ -370,6 +384,30 @@ export class Engine {
       masterAccount: session()?.wallet ?? null,
       wallets: this.wallets(), killSwitch: this.killSwitch, keepingAwake: !!this.awake, agents: this.list(),
     };
+  }
+
+  /** Where the agent stands against its goal: the compounding path from start to target over the chosen days. */
+  pace(rec: AgentRecord, equity: number) {
+    const g = rec.settings?.goal;
+    if (!g) return null;
+    const days = (Date.now() - rec.createdAt) / 86_400_000;
+    const perDay = (g.targetUsd / g.startUsd) ** (1 / g.days);
+    const path = g.startUsd * perDay ** Math.min(days, g.days);
+    return { target: g.targetUsd, byDay: g.days, neededPerDayPct: Math.round((perDay - 1) * 1000) / 10, pathNow: Math.round(path * 100) / 100, equity: Math.round(equity * 100) / 100,
+      status: equity >= path ? 'ahead' : 'behind', daysLeft: Math.max(0, Math.round((g.days - days) * 10) / 10) };
+  }
+
+  /** Engine-wide settings: CPU priority (low keeps the computer snappy) and whether to keep it awake while trading. */
+  config = readJson<{ priority: 'low' | 'normal'; keepAwake: boolean }>('engine.json', { priority: 'low', keepAwake: true });
+  setConfig(c: Partial<{ priority: 'low' | 'normal'; keepAwake: boolean }>) {
+    this.config = { ...this.config, ...(c.priority ? { priority: c.priority } : {}), ...(typeof c.keepAwake === 'boolean' ? { keepAwake: c.keepAwake } : {}) };
+    writeJson('engine.json', this.config);
+    this.applyPriority();
+    if (!this.config.keepAwake && this.awake) { this.awake.kill(); this.awake = undefined; }
+    return this.config;
+  }
+  applyPriority() {
+    try { osSetPriority(process.pid, this.config.priority === 'low' ? 10 : 0); } catch { /* not allowed on this OS */ }
   }
 
   /** Every agent wallet with its balance, key state and agent. */
@@ -396,7 +434,7 @@ export class Engine {
 
   private keepAwake(): void {
     const exposed = [...this.live.values()].some((a) => a.rec.mirrors.some((m) => m.status === 'open' || m.status === 'opening' || m.status === 'closing'));
-    if (exposed && !this.awake) {
+    if (exposed && !this.awake && this.config.keepAwake) {
       const cmd = process.platform === 'darwin' ? ['caffeinate', ['-i', '-w', String(process.pid)]] as const
         : process.platform === 'linux' ? ['systemd-inhibit', ['--what=sleep:idle', '--why=PaperQuants has open trades', 'sleep', 'infinity']] as const : null;
       if (cmd) {
@@ -449,7 +487,7 @@ export class Engine {
         return { coin: p.coin, side: p.side, lev: p.leverage, margin: p.margin, entry: p.entry, mark, bps: Math.round(bps * 100) / 100, pnl: Math.round(p.margin * p.leverage * bps / 1e4 * 100) / 100, ageSec: Math.round((now - p.openedAt) / 1000) };
       });
       const snapshot = { stats: { trades: d.paper.trades, wins: d.paper.wins, winRate: d.paper.winRate, pnlPct: d.paper.pnlPct, maxDrawdownPct: d.paper.maxDrawdownPct },
-        positions, trades: (a.rec.recent ?? []).slice(-30), equity: [...a.rec.curve, Math.round(equity * 100) / 100].slice(-120), log: a.rec.log.slice(-6), thesis: a.rec.thesis, coins: a.rec.limits.coins };
+        settings: a.rec.settings ?? {}, pace: this.pace(a.rec, equity), positions, trades: (a.rec.recent ?? []).slice(-30), equity: [...a.rec.curve, Math.round(equity * 100) / 100].slice(-120), log: a.rec.log.slice(-6), thesis: a.rec.thesis, coins: a.rec.limits.coins };
       await api(`/api/net/agents/${a.rec.netId}/heartbeat`, { auth: true, body: { equity, open: positions.length, status: d.status, snapshot } }).catch(() => {});
     }
   }

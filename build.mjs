@@ -9,5 +9,6 @@ await build({
   target: 'node22',
   banner: { js: "#!/usr/bin/env node\nimport { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
   external: ['@modelcontextprotocol/sdk', 'viem', 'zod'],
+  define: { __BUILD__: JSON.stringify(new Date().toISOString()) },
   logLevel: 'info',
 });

@@ -127,8 +127,11 @@ export async function runMcp(): Promise<void> {
       preset: z.enum(['careful', 'balanced', 'aggressive', 'degen']).optional().describe('careful 100× / 10% per trade / 20% daily stop · balanced 300× / 25% / 35% · aggressive 500× / 40% / 50% · degen 1000× / 50% / 70%. Coins and capital still apply.'),
       limits: limits.partial().optional().describe('Overrides on top of the preset. Defaults: capitalUsd 1000 (demo money), coins BTC+ETH.'),
       mode: z.enum(['demo', 'live']).default('demo').describe('demo (default) = demo money, no wallet. live = real money on its own wallet.'),
+      goal: z.object({ start_usd: z.number().positive().optional(), target_usd: z.number().positive(), days: z.number().positive() }).optional().describe('The user\'s goal, e.g. $1,000 → $5,000 in 7 days. Shown on the site; check-ins report ahead/behind pace.'),
+      rules: z.string().max(2000).optional().describe('The user\'s own rules in their words (also baked into the code), e.g. "only US hours, max 3 trades a day".'),
+      checkin_minutes: z.number().int().min(5).max(1440).optional().describe('How often you check in on this agent (default 30).'),
       wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe("Live only: this agent's OWN wallet (from new_agent_wallet or connect_external_wallet). One agent per wallet, never shared."), user_approved: z.boolean() },
-  }, wrap(async ({ user_approved, preset, limits: l, ai_model, strategy, ...a }) => {
+  }, wrap(async ({ user_approved, preset, limits: l, ai_model, strategy, goal, rules, checkin_minutes, ...a }) => {
     if (strategy) {
       const m = (await api<Array<{ key: string; code: string; params: Record<string, unknown>; why: string; coins: string[] }>>('/api/net/strategies')).find((x) => x.key === strategy);
       if (!m) throw new Error(`no strategy "${strategy}" in strategy_menu`);
@@ -139,7 +142,10 @@ export async function runMcp(): Promise<void> {
     return engine('/agents', {
     ...a, limits: { capitalUsd: 1000, coins: ['BTC', 'ETH'], ...(preset ? PRESETS[preset] : PRESETS.balanced), ...(l ?? {}) },
     userApproved: a.mode === 'demo' ? true : user_approved, model: modelLabel(clientApp(server), ai_model),
+    settings: { goal: goal ? { startUsd: goal.start_usd ?? l?.capitalUsd ?? 1000, targetUsd: goal.target_usd, days: goal.days } : undefined, rules, checkinMinutes: checkin_minutes ?? 30 },
   }); }));
+  server.registerTool('engine_settings', { description: 'Engine settings on this computer: priority low (default, keeps the computer responsive) or normal, and keep_awake (stop sleep while trades are open). Omit both to read them.', inputSchema: { priority: z.enum(['low', 'normal']).optional(), keep_awake: z.boolean().optional() } },
+    wrap(async ({ priority, keep_awake }) => (priority || keep_awake !== undefined ? engine('/config', { priority, keepAwake: keep_awake }) : engine('/config'))));
   server.registerTool('go_live', {
     description: "Switch a demo agent to real money on its own wallet (same strategy and limits; capitalUsd can be set). Only after the user saw its demo results and explicitly approved real money.",
     inputSchema: { id: z.string(), wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/), capital_usd: z.number().positive().optional(), user_approved: z.boolean() },

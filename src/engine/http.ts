@@ -2,7 +2,7 @@
 // the connect page (opened in the user's browser) gets the same token in its URL.
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { verifyMessage, type Hex } from 'viem';
-import { ENGINE_PORT, engineToken, VERSION, API_URL } from '../home.ts';
+import { ENGINE_PORT, engineToken, VERSION, BUILD, API_URL } from '../home.ts';
 import { api, loginMessage, netConfig, saveSession, session } from '../net.ts';
 import { connectPage } from './connectPage.ts';
 import { createLocalWallet, startExternalKey, confirmExternalKey, findWallet, updateWallet, exportLocalKey, sweepLocal, linkMessage, PapertradeAdapter } from './adapter.ts';
@@ -30,7 +30,7 @@ export function serve(engine: Engine) {
       const m = `${req.method} ${url.pathname}`;
       const b = req.method === 'GET' ? {} : await body(req);
       let id: string | undefined;
-      if (m === 'GET /status') return send(200, { version: VERSION, accountPage: session() ? accountUrl(session()!.wallet) : null, ...engine.status() });
+      if (m === 'GET /status') return send(200, { version: VERSION, build: BUILD, accountPage: session() ? accountUrl(session()!.wallet) : null, ...engine.status() });
       if (m === 'GET /agents') return send(200, engine.list());
       if (m === 'POST /agents') return send(200, await engine.createAgent(b));
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)$/)?.[1]) && req.method === 'GET') return send(200, engine.describe(id));
@@ -38,6 +38,9 @@ export function serve(engine: Engine) {
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/status$/)?.[1]) && req.method === 'POST') return send(200, engine.setStatus(id, b.status));
       if ((id = url.pathname.match(/^\/agents\/([\w-]+)\/live$/)?.[1]) && req.method === 'POST') return send(200, engine.goLive(id, b.wallet, b.userApproved, b.capitalUsd));
       if (m === 'POST /kill') return send(200, engine.setKill(!!b.on));
+      if (m === 'POST /shutdown') { send(200, { ok: true }); engine.stop(); setTimeout(() => process.exit(0), 200); return; }
+      if (m === 'GET /config') return send(200, engine.config);
+      if (m === 'POST /config') return send(200, engine.setConfig(b));
 
       // ---- agent wallets (one per agent) ----
       if (m === 'GET /wallets') return send(200, engine.wallets());

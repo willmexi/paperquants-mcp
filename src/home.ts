@@ -14,6 +14,9 @@ export const API_URL = (process.env.PAPERQUANTS_API ?? 'https://paperquants.com'
 /** The local engine's control port (127.0.0.1 only). */
 export const ENGINE_PORT = Number(process.env.PAPERQUANTS_PORT ?? 47321);
 export const VERSION = '0.1.0';
+declare const __BUILD__: string;
+/** Set at build time: an engine from an older build is replaced automatically when the MCP starts. */
+export const BUILD = typeof __BUILD__ === 'string' ? __BUILD__ : 'dev';
 
 export const file = (name: string) => join(HOME, name);
 

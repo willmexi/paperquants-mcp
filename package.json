@@ -1,0 +1,40 @@
+{
+  "name": "paperquants",
+  "version": "0.1.0",
+  "description": "PaperQuants for Claude: research, backtest and run 500-1000x trading agents on your own Papertrade account. Your key never leaves your machine.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "paperquants": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "viem": "^2.57.11",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/willmexi/paperquants-mcp.git"
+  },
+  "homepage": "https://paperquants.com/install"
+}
